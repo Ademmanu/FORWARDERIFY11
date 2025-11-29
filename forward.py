@@ -158,6 +158,9 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
+    # Clean up any previous states
+    cleanup_conversation_states(user_id, context)
+
     if not await check_authorization(update, context):
         return
 
@@ -222,6 +225,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def cleanup_conversation_states(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Clean up any conversation states for a user"""
+    # Clear user_data for this user
+    if context.user_data:
+        context.user_data.clear()
+    
+    # Remove from login states
+    if user_id in login_states:
+        try:
+            client = login_states[user_id].get("client")
+            if client:
+                asyncio.create_task(client.disconnect())
+        except Exception:
+            pass
+        finally:
+            login_states.pop(user_id, None)
+    
+    # Remove from logout states
+    logout_states.pop(user_id, None)
+
+
 # ---------- Fixed Button Handler ----------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -263,10 +287,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_chat_categories(user_id, query.message.chat.id, query.message.message_id, context)
             else:
                 parts = data.split("_")
-                category = parts[1]
-                page = int(parts[2])
-                await show_categorized_chats(user_id, query.message.chat.id, query.message.message_id, category, page, context)
+                if len(parts) >= 3:
+                    category = parts[1]
+                    try:
+                        page = int(parts[2])
+                        await show_categorized_chats(user_id, query.message.chat.id, query.message.message_id, category, page, context)
+                    except ValueError:
+                        await query.answer("❌ Invalid page number!")
+                else:
+                    await query.answer("❌ Invalid chatids button!")
         else:
+            logger.warning(f"Unhandled button data: {data}")
             await query.answer("❌ Unknown button action!")
     except Exception as e:
         logger.exception(f"Error in button handler for data {data}: {e}")
@@ -306,7 +337,11 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
+    
+    # Only process if user is in login or logout state
+    if user_id not in login_states and user_id not in logout_states:
+        return
+    
     if user_id in logout_states:
         handled = await handle_logout_confirmation(update, context)
         if handled:
@@ -917,6 +952,11 @@ async def delete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
+    # Only process if there's a pending deletion
+    if 'delete_task_id' not in context.user_data:
+        return
+    
     text = update.message.text.strip()
     
     if 'delete_task_id' not in context.user_data:
@@ -1793,6 +1833,25 @@ def _get_memory_usage_mb():
         return None
 
 
+# ---------- Unified Message Handler ----------
+async def unified_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all text messages and route them to appropriate handlers based on state"""
+    user_id = update.effective_user.id
+
+    # Check if user is in login or logout state
+    if user_id in login_states or user_id in logout_states:
+        await handle_login_process(update, context)
+        return
+
+    # Check if user has a pending delete
+    if 'delete_task_id' in context.user_data:
+        await confirm_delete_handler(update, context)
+        return
+
+    # If no special state, ignore the message
+    # This prevents double processing of regular messages
+
+
 # ---------- Main -----------
 def main():
     if not BOT_TOKEN:
@@ -1822,7 +1881,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
 
-    # Add all handlers
+    # Add all handlers in correct order with proper filtering
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login_command))
     application.add_handler(CommandHandler("logout", logout_command))
@@ -1833,9 +1892,12 @@ def main():
     application.add_handler(CommandHandler("removeuser", removeuser_command))
     application.add_handler(CommandHandler("listusers", listusers_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_process))
-    # Add handler for delete confirmation
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_delete_handler))
+    
+    # FIXED: Use unified message handler to prevent duplicate processing
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, 
+        unified_message_handler
+    ))
 
     logger.info("✅ Bot ready!")
     try:
