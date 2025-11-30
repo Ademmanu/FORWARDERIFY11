@@ -1,3 +1,4 @@
+```python
 import sqlite3
 import json
 import threading
@@ -10,6 +11,7 @@ logger = logging.getLogger("database")
 
 """
 Optimized SQLite helper for FORWARDIFY - Fixed connection management
+Includes persistent storage for per-task settings (JSON in forwarding_tasks.settings)
 """
 
 _conn_init_lock = threading.Lock()
@@ -96,6 +98,7 @@ class Database:
             """
             )
 
+            # Add settings TEXT column (JSON) for per-task persistent settings.
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS forwarding_tasks (
@@ -104,6 +107,7 @@ class Database:
                     label TEXT,
                     source_ids TEXT,
                     target_ids TEXT,
+                    settings TEXT DEFAULT '{}',
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
@@ -112,25 +116,18 @@ class Database:
             """
             )
 
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS task_filters (
-                    task_id INTEGER PRIMARY KEY,
-                    filter_raw_text INTEGER DEFAULT 1,
-                    filter_numbers_only INTEGER DEFAULT 0,
-                    filter_alphabets_only INTEGER DEFAULT 0,
-                    filter_removed_alphabetic INTEGER DEFAULT 0,
-                    filter_removed_numeric INTEGER DEFAULT 0,
-                    filter_prefix_suffix INTEGER DEFAULT 0,
-                    prefix_text TEXT DEFAULT '',
-                    suffix_text TEXT DEFAULT '',
-                    outgoing_enabled INTEGER DEFAULT 1,
-                    forward_tag_enabled INTEGER DEFAULT 0,
-                    control_enabled INTEGER DEFAULT 1,
-                    FOREIGN KEY (task_id) REFERENCES forwarding_tasks (id) ON DELETE CASCADE
-                )
-            """
-            )
+            # Migration: ensure settings column exists for older DBs (best-effort)
+            try:
+                cur.execute("PRAGMA table_info(forwarding_tasks)")
+                cols = [r[1] for r in cur.fetchall()]
+                if "settings" not in cols:
+                    try:
+                        cur.execute("ALTER TABLE forwarding_tasks ADD COLUMN settings TEXT DEFAULT '{}';")
+                    except Exception:
+                        # If ALTER fails (rare on some sqlite builds), ignore - table was created above with settings normally
+                        pass
+            except Exception:
+                pass
 
             cur.execute(
                 """
@@ -221,29 +218,23 @@ class Database:
             raise
         # REMOVED: finally: self.close_connection() - Keep connection open
 
-    def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int]) -> bool:
+    def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int], settings: Optional[Dict] = None) -> bool:
+        """
+        Create a forwarding task. 'settings' is an optional dict that will be stored as JSON.
+        Returns True on success, False if UNIQUE constraint (task exists).
+        """
         conn = self.get_connection()
         try:
             cur = conn.cursor()
             try:
+                s_json = json.dumps(settings or {})
                 cur.execute(
                     """
-                    INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, settings)
+                    VALUES (?, ?, ?, ?, ?)
                 """,
-                    (user_id, label, json.dumps(source_ids), json.dumps(target_ids)),
+                    (user_id, label, json.dumps(source_ids), json.dumps(target_ids), s_json),
                 )
-                task_id = cur.lastrowid
-                
-                # Create default filter settings
-                cur.execute(
-                    """
-                    INSERT INTO task_filters (task_id)
-                    VALUES (?)
-                """,
-                    (task_id,),
-                )
-                
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
@@ -253,21 +244,46 @@ class Database:
             raise
         # REMOVED: finally: self.close_connection() - Keep connection open
 
+    def update_task_settings(self, user_id: int, label: str, settings: Dict) -> bool:
+        """
+        Update the settings JSON for a given task (by user and label).
+        Returns True if row was updated, False otherwise.
+        """
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            s_json = json.dumps(settings or {})
+            cur.execute("UPDATE forwarding_tasks SET settings = ?, updated_at = ? WHERE user_id = ? AND label = ?",
+                        (s_json, datetime.now().isoformat(), user_id, label))
+            updated = cur.rowcount > 0
+            conn.commit()
+            return updated
+        except Exception as e:
+            logger.exception("Error in update_task_settings for %s/%s: %s", user_id, label, e)
+            raise
+
+    def get_task_settings(self, user_id: int, label: str) -> Optional[Dict]:
+        conn = self.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT settings FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
+            row = cur.fetchone()
+            if not row:
+                return None
+            raw = row["settings"]
+            try:
+                return json.loads(raw) if raw else {}
+            except Exception:
+                return {}
+        except Exception as e:
+            logger.exception("Error in get_task_settings for %s/%s: %s", user_id, label, e)
+            raise
+
     def remove_forwarding_task(self, user_id: int, label: str) -> bool:
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            # Get task_id first
-            cur.execute("SELECT id FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
-            task_row = cur.fetchone()
-            
-            if task_row:
-                task_id = task_row["id"]
-                # Delete from task_filters (cascade should handle this, but explicit is better)
-                cur.execute("DELETE FROM task_filters WHERE task_id = ?", (task_id,))
-                # Delete from forwarding_tasks
-                cur.execute("DELETE FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
-                
+            cur.execute("DELETE FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
             deleted = cur.rowcount > 0
             conn.commit()
             return deleted
@@ -282,41 +298,29 @@ class Database:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT ft.id, ft.label, ft.source_ids, ft.target_ids, ft.is_active, ft.created_at,
-                       tf.filter_raw_text, tf.filter_numbers_only, tf.filter_alphabets_only,
-                       tf.filter_removed_alphabetic, tf.filter_removed_numeric, tf.filter_prefix_suffix,
-                       tf.prefix_text, tf.suffix_text, tf.outgoing_enabled, tf.forward_tag_enabled, tf.control_enabled
-                FROM forwarding_tasks ft
-                LEFT JOIN task_filters tf ON ft.id = tf.task_id
-                WHERE ft.user_id = ? AND ft.is_active = 1
-                ORDER BY ft.created_at DESC
+                SELECT id, label, source_ids, target_ids, settings, is_active, created_at
+                FROM forwarding_tasks
+                WHERE user_id = ? AND is_active = 1
+                ORDER BY created_at DESC
             """,
                 (user_id,),
             )
 
             tasks = []
             for row in cur.fetchall():
+                try:
+                    settings = json.loads(row["settings"]) if row["settings"] else {}
+                except Exception:
+                    settings = {}
                 tasks.append(
                     {
                         "id": row["id"],
                         "label": row["label"],
                         "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
                         "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
+                        "settings": settings,
                         "is_active": row["is_active"],
                         "created_at": row["created_at"],
-                        "filters": {
-                            "filter_raw_text": bool(row["filter_raw_text"]),
-                            "filter_numbers_only": bool(row["filter_numbers_only"]),
-                            "filter_alphabets_only": bool(row["filter_alphabets_only"]),
-                            "filter_removed_alphabetic": bool(row["filter_removed_alphabetic"]),
-                            "filter_removed_numeric": bool(row["filter_removed_numeric"]),
-                            "filter_prefix_suffix": bool(row["filter_prefix_suffix"]),
-                            "prefix_text": row["prefix_text"] or "",
-                            "suffix_text": row["suffix_text"] or "",
-                            "outgoing_enabled": bool(row["outgoing_enabled"]),
-                            "forward_tag_enabled": bool(row["forward_tag_enabled"]),
-                            "control_enabled": bool(row["control_enabled"]),
-                        }
                     }
                 )
 
@@ -332,17 +336,17 @@ class Database:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT ft.user_id, ft.id, ft.label, ft.source_ids, ft.target_ids,
-                       tf.filter_raw_text, tf.filter_numbers_only, tf.filter_alphabets_only,
-                       tf.filter_removed_alphabetic, tf.filter_removed_numeric, tf.filter_prefix_suffix,
-                       tf.prefix_text, tf.suffix_text, tf.outgoing_enabled, tf.forward_tag_enabled, tf.control_enabled
-                FROM forwarding_tasks ft
-                LEFT JOIN task_filters tf ON ft.id = tf.task_id
-                WHERE ft.is_active = 1
+                SELECT user_id, id, label, source_ids, target_ids, settings
+                FROM forwarding_tasks
+                WHERE is_active = 1
             """
             )
             tasks = []
             for row in cur.fetchall():
+                try:
+                    settings = json.loads(row["settings"]) if row["settings"] else {}
+                except Exception:
+                    settings = {}
                 tasks.append(
                     {
                         "user_id": row["user_id"],
@@ -350,70 +354,12 @@ class Database:
                         "label": row["label"],
                         "source_ids": json.loads(row["source_ids"]) if row["source_ids"] else [],
                         "target_ids": json.loads(row["target_ids"]) if row["target_ids"] else [],
-                        "filters": {
-                            "filter_raw_text": bool(row["filter_raw_text"]),
-                            "filter_numbers_only": bool(row["filter_numbers_only"]),
-                            "filter_alphabets_only": bool(row["filter_alphabets_only"]),
-                            "filter_removed_alphabetic": bool(row["filter_removed_alphabetic"]),
-                            "filter_removed_numeric": bool(row["filter_removed_numeric"]),
-                            "filter_prefix_suffix": bool(row["filter_prefix_suffix"]),
-                            "prefix_text": row["prefix_text"] or "",
-                            "suffix_text": row["suffix_text"] or "",
-                            "outgoing_enabled": bool(row["outgoing_enabled"]),
-                            "forward_tag_enabled": bool(row["forward_tag_enabled"]),
-                            "control_enabled": bool(row["control_enabled"]),
-                        }
+                        "settings": settings,
                     }
                 )
             return tasks
         except Exception as e:
             logger.exception("Error in get_all_active_tasks: %s", e)
-            raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
-
-    def update_task_filter(self, task_id: int, filter_name: str, value: bool) -> bool:
-        conn = self.get_connection()
-        try:
-            cur = conn.cursor()
-            
-            # Map filter names to column names
-            column_map = {
-                'filter_raw_text': 'filter_raw_text',
-                'filter_numbers_only': 'filter_numbers_only', 
-                'filter_alphabets_only': 'filter_alphabets_only',
-                'filter_removed_alphabetic': 'filter_removed_alphabetic',
-                'filter_removed_numeric': 'filter_removed_numeric',
-                'filter_prefix_suffix': 'filter_prefix_suffix',
-                'outgoing_enabled': 'outgoing_enabled',
-                'forward_tag_enabled': 'forward_tag_enabled',
-                'control_enabled': 'control_enabled'
-            }
-            
-            if filter_name in column_map:
-                cur.execute(
-                    f"UPDATE task_filters SET {column_map[filter_name]} = ? WHERE task_id = ?",
-                    (1 if value else 0, task_id)
-                )
-                conn.commit()
-                return cur.rowcount > 0
-            return False
-        except Exception as e:
-            logger.exception("Error in update_task_filter for task %s: %s", task_id, e)
-            raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
-
-    def update_prefix_suffix(self, task_id: int, prefix: str = "", suffix: str = "") -> bool:
-        conn = self.get_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE task_filters SET prefix_text = ?, suffix_text = ? WHERE task_id = ?",
-                (prefix, suffix, task_id)
-            )
-            conn.commit()
-            return cur.rowcount > 0
-        except Exception as e:
-            logger.exception("Error in update_prefix_suffix for task %s: %s", task_id, e)
             raise
         # REMOVED: finally: self.close_connection() - Keep connection open
 
@@ -540,7 +486,7 @@ class Database:
                     # ignore if PRAGMA unsupported
                     status["user_version"] = None
 
-                for table in ("users", "forwarding_tasks", "allowed_users", "task_filters"):
+                for table in ("users", "forwarding_tasks", "allowed_users"):
                     try:
                         cur.execute(f"SELECT COUNT(1) as c FROM {table}")
                         crow = cur.fetchone()
@@ -567,3 +513,4 @@ class Database:
             self.close_connection()
         except Exception:
             pass
+```
