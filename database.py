@@ -1,4 +1,3 @@
-```python
 import sqlite3
 import json
 import threading
@@ -513,4 +512,3 @@ class Database:
             self.close_connection()
         except Exception:
             pass
-```
