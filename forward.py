@@ -201,7 +201,7 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
     return True
 
 
-# ---------- Simple UI handlers (left mostly unchanged) ----------
+# ---------- Simple UI handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -262,7 +262,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
 
-    # safe: update.message is present for /start
     await update.message.reply_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
@@ -287,8 +286,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "show_tasks":
         await query.message.delete()
         await fortasks_command(update, context)
+    elif query.data == "show_tasks_back":
+        await fortasks_command(update, context)
     elif query.data.startswith("task_"):
-        await handle_task_management(update, context)
+        # Handle task management buttons
+        if any(x in query.data for x in ["_outgoing", "_forward_tag", "_control", "_delete"]):
+            await handle_task_setting_toggle(update, context)
+        else:
+            # This is a task selection (task_<label>)
+            await handle_task_management(update, context)
     elif query.data.startswith("filter_"):
         await handle_filter_management(update, context)
     elif query.data.startswith("chatids_"):
@@ -337,21 +343,24 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="show_tasks_back")])
 
-    await message.reply_text(
-        message_text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+    else:
+        await message.reply_text(
+            message_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
 
 
 async def handle_task_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     
-    if query.data == "show_tasks_back":
-        await fortasks_command(update, context)
-        return
-        
     # Extract task label from callback data (task_<label>)
     task_label = query.data[5:]  # Remove "task_" prefix
     
@@ -515,16 +524,19 @@ async def handle_task_setting_toggle(update: Update, context: ContextTypes.DEFAU
         new_value = not task.get("outgoing_enabled", False)
         task["outgoing_enabled"] = new_value
         await db_call(db.update_task_settings, user_id, task_label, {"outgoing_enabled": new_value})
+        await query.answer(f"✅ Outgoing messages {'enabled' if new_value else 'disabled'}")
         
     elif setting == "forward_tag":
         new_value = not task.get("forward_tag_enabled", False)
         task["forward_tag_enabled"] = new_value
         await db_call(db.update_task_settings, user_id, task_label, {"forward_tag_enabled": new_value})
+        await query.answer(f"✅ Forward tag {'enabled' if new_value else 'disabled'}")
         
     elif setting == "control":
         new_value = not task.get("control_enabled", True)
         task["control_enabled"] = new_value
         await db_call(db.update_task_settings, user_id, task_label, {"control_enabled": new_value})
+        await query.answer(f"✅ Task {'enabled' if new_value else 'disabled'}")
         
     elif setting == "delete":
         # Confirm deletion
@@ -584,9 +596,11 @@ async def handle_filter_toggle(update: Update, context: ContextTypes.DEFAULT_TYP
     # Find the task
     user_tasks = tasks_cache.get(user_id, [])
     task = None
-    for t in user_tasks:
+    task_index = None
+    for i, t in enumerate(user_tasks):
         if t["label"] == task_label:
             task = t
+            task_index = i
             break
     
     if not task:
@@ -622,14 +636,17 @@ async def handle_filter_toggle(update: Update, context: ContextTypes.DEFAULT_TYP
     # Toggle regular filter
     if filter_type in current_filters:
         current_filters.remove(filter_type)
+        await query.answer(f"❌ {filter_type} disabled")
     else:
         current_filters.append(filter_type)
+        await query.answer(f"✅ {filter_type} enabled")
     
     # Update in database
     await db_call(db.update_task_settings, user_id, task_label, {"filters": current_filters})
     
     # Update cache
-    task["filters"] = current_filters
+    if task_index is not None:
+        tasks_cache[user_id][task_index]["filters"] = current_filters
     
     # Show updated filter management screen
     await handle_filter_management(update, context)
@@ -1842,11 +1859,9 @@ def main():
     application.add_handler(CommandHandler("adduser", adduser_command))
     application.add_handler(CommandHandler("removeuser", removeuser_command))
     application.add_handler(CommandHandler("listusers", listusers_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
     
-    # Add specific callback handlers for task management
-    application.add_handler(CallbackQueryHandler(handle_task_setting_toggle, pattern="^task_.*_(outgoing|forward_tag|control|delete|delete_confirm)$"))
-    application.add_handler(CallbackQueryHandler(handle_filter_toggle, pattern="^filter_.*"))
+    # Main callback query handler - handles all inline button interactions
+    application.add_handler(CallbackQueryHandler(button_handler))
     
     # Handle both login process and task creation
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_process))
