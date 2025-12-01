@@ -9,8 +9,8 @@ import logging
 logger = logging.getLogger("database")
 
 """
-Optimized SQLite helper for FORWARDIFY - Fixed connection management
-Includes persistent storage for per-task settings (JSON in forwarding_tasks.settings)
+SQLite helper for FORWARDIFY with per-task settings persistence.
+Thread-local connections and pragmatic pragmas for better reliability.
 """
 
 _conn_init_lock = threading.Lock()
@@ -20,7 +20,6 @@ _thread_local = threading.local()
 class Database:
     def __init__(self, db_path: str = "bot_data.db"):
         self.db_path = db_path
-        # initialize DB schema
         try:
             self.init_db()
         except Exception:
@@ -31,28 +30,22 @@ class Database:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.execute("PRAGMA temp_store=MEMORY;")
-            conn.execute("PRAGMA cache_size=-1000;")  # Reduced cache size for memory efficiency
-            conn.execute("PRAGMA mmap_size=268435456;")  # 256MB mmap for better performance
+            conn.execute("PRAGMA cache_size=-1000;")
+            conn.execute("PRAGMA mmap_size=268435456;")
         except Exception:
-            # best-effort - don't fail if environment doesn't allow these pragmas
+            # best-effort; do not fail startup
             pass
 
     def _create_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-        # use sqlite3.Row for named column access; conversion of datetime kept off
         conn.row_factory = sqlite3.Row
         self._apply_pragmas(conn)
         return conn
 
     def get_connection(self) -> sqlite3.Connection:
-        """
-        Return a thread-local connection (create if missing).
-        FIXED: Don't close connections aggressively during normal operations
-        """
         conn = getattr(_thread_local, "conn", None)
         if conn:
             try:
-                # cheap check to ensure connection is alive
                 conn.execute("SELECT 1")
                 return conn
             except Exception:
@@ -70,7 +63,6 @@ class Database:
             raise
 
     def close_connection(self):
-        """Only close connection when absolutely necessary (shutdown/idle)"""
         conn = getattr(_thread_local, "conn", None)
         if conn:
             try:
@@ -83,6 +75,8 @@ class Database:
         with _conn_init_lock:
             conn = self.get_connection()
             cur = conn.cursor()
+
+            # users table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -94,10 +88,10 @@ class Database:
                     created_at TEXT DEFAULT (datetime('now')),
                     updated_at TEXT DEFAULT (datetime('now'))
                 )
-            """
+                """
             )
 
-            # Add settings TEXT column (JSON) for per-task persistent settings.
+            # forwarding_tasks with settings_json column for per-task settings
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS forwarding_tasks (
@@ -106,28 +100,16 @@ class Database:
                     label TEXT,
                     source_ids TEXT,
                     target_ids TEXT,
-                    settings TEXT DEFAULT '{}',
+                    settings_json TEXT,
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
                     UNIQUE(user_id, label)
                 )
-            """
+                """
             )
 
-            # Migration: ensure settings column exists for older DBs (best-effort)
-            try:
-                cur.execute("PRAGMA table_info(forwarding_tasks)")
-                cols = [r[1] for r in cur.fetchall()]
-                if "settings" not in cols:
-                    try:
-                        cur.execute("ALTER TABLE forwarding_tasks ADD COLUMN settings TEXT DEFAULT '{}';")
-                    except Exception:
-                        # If ALTER fails (rare on some sqlite builds), ignore - table was created above with settings normally
-                        pass
-            except Exception:
-                pass
-
+            # allowed_users table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS allowed_users (
@@ -137,11 +119,12 @@ class Database:
                     added_by INTEGER,
                     created_at TEXT DEFAULT (datetime('now'))
                 )
-            """
+                """
             )
 
             conn.commit()
-            # REMOVED: self.close_connection() - Keep connection open for subsequent operations
+
+    # ----------------- Users -----------------
 
     def get_user(self, user_id: int) -> Optional[Dict]:
         conn = self.get_connection()
@@ -151,7 +134,6 @@ class Database:
             row = cur.fetchone()
             if not row:
                 return None
-            # sqlite3.Row -> dict
             return {
                 "user_id": row["user_id"],
                 "phone": row["phone"],
@@ -161,10 +143,9 @@ class Database:
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }
-        except Exception as e:
-            logger.exception("Error in get_user for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Error in get_user for %s", user_id)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def save_user(
         self,
@@ -178,11 +159,9 @@ class Database:
         try:
             cur = conn.cursor()
             existing = self.get_user(user_id)
-
             if existing:
                 updates = []
                 params = []
-
                 if phone is not None:
                     updates.append("phone = ?")
                     params.append(phone)
@@ -192,13 +171,10 @@ class Database:
                 if session_data is not None:
                     updates.append("session_data = ?")
                     params.append(session_data)
-
                 updates.append("is_logged_in = ?")
                 params.append(1 if is_logged_in else 0)
-
                 updates.append("updated_at = ?")
                 params.append(datetime.now().isoformat())
-
                 params.append(user_id)
                 query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = ?"
                 cur.execute(query, params)
@@ -207,75 +183,61 @@ class Database:
                     """
                     INSERT INTO users (user_id, phone, name, session_data, is_logged_in)
                     VALUES (?, ?, ?, ?, ?)
-                """,
+                    """,
                     (user_id, phone, name, session_data, 1 if is_logged_in else 0),
                 )
-
             conn.commit()
-        except Exception as e:
-            logger.exception("Error in save_user for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Error in save_user for %s", user_id)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
+
+    # ----------------- Forwarding tasks -----------------
 
     def add_forwarding_task(self, user_id: int, label: str, source_ids: List[int], target_ids: List[int], settings: Optional[Dict] = None) -> bool:
         """
-        Create a forwarding task. 'settings' is an optional dict that will be stored as JSON.
-        Returns True on success, False if UNIQUE constraint (task exists).
+        Create a new forwarding task. settings is optional dict that will be JSON-encoded into settings_json.
+        Returns True if created, False if a UNIQUE constraint prevented insertion (task with same label exists).
         """
         conn = self.get_connection()
         try:
             cur = conn.cursor()
             try:
-                s_json = json.dumps(settings or {})
                 cur.execute(
                     """
-                    INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, settings)
+                    INSERT INTO forwarding_tasks (user_id, label, source_ids, target_ids, settings_json)
                     VALUES (?, ?, ?, ?, ?)
-                """,
-                    (user_id, label, json.dumps(source_ids), json.dumps(target_ids), s_json),
+                    """,
+                    (
+                        user_id,
+                        label,
+                        json.dumps(source_ids),
+                        json.dumps(target_ids),
+                        json.dumps(settings or {}),
+                    ),
                 )
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
                 return False
-        except Exception as e:
-            logger.exception("Error in add_forwarding_task for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Error in add_forwarding_task for %s", user_id)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def update_task_settings(self, user_id: int, label: str, settings: Dict) -> bool:
         """
-        Update the settings JSON for a given task (by user and label).
-        Returns True if row was updated, False otherwise.
+        Update settings_json for a task. Returns True if updated rowcount > 0.
         """
         conn = self.get_connection()
         try:
             cur = conn.cursor()
-            s_json = json.dumps(settings or {})
-            cur.execute("UPDATE forwarding_tasks SET settings = ?, updated_at = ? WHERE user_id = ? AND label = ?",
-                        (s_json, datetime.now().isoformat(), user_id, label))
-            updated = cur.rowcount > 0
+            cur.execute(
+                "UPDATE forwarding_tasks SET settings_json = ?, updated_at = ? WHERE user_id = ? AND label = ?",
+                (json.dumps(settings), datetime.now().isoformat(), user_id, label),
+            )
             conn.commit()
-            return updated
-        except Exception as e:
-            logger.exception("Error in update_task_settings for %s/%s: %s", user_id, label, e)
-            raise
-
-    def get_task_settings(self, user_id: int, label: str) -> Optional[Dict]:
-        conn = self.get_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT settings FROM forwarding_tasks WHERE user_id = ? AND label = ?", (user_id, label))
-            row = cur.fetchone()
-            if not row:
-                return None
-            raw = row["settings"]
-            try:
-                return json.loads(raw) if raw else {}
-            except Exception:
-                return {}
-        except Exception as e:
-            logger.exception("Error in get_task_settings for %s/%s: %s", user_id, label, e)
+            return cur.rowcount > 0
+        except Exception:
+            logger.exception("Error in update_task_settings for %s:%s", user_id, label)
             raise
 
     def remove_forwarding_task(self, user_id: int, label: str) -> bool:
@@ -286,10 +248,9 @@ class Database:
             deleted = cur.rowcount > 0
             conn.commit()
             return deleted
-        except Exception as e:
-            logger.exception("Error in remove_forwarding_task for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Error in remove_forwarding_task for %s:%s", user_id, label)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_user_tasks(self, user_id: int) -> List[Dict]:
         conn = self.get_connection()
@@ -297,18 +258,17 @@ class Database:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT id, label, source_ids, target_ids, settings, is_active, created_at
+                SELECT id, label, source_ids, target_ids, settings_json, is_active, created_at
                 FROM forwarding_tasks
                 WHERE user_id = ? AND is_active = 1
                 ORDER BY created_at DESC
-            """,
+                """,
                 (user_id,),
             )
-
             tasks = []
             for row in cur.fetchall():
                 try:
-                    settings = json.loads(row["settings"]) if row["settings"] else {}
+                    settings = json.loads(row["settings_json"]) if row["settings_json"] else {}
                 except Exception:
                     settings = {}
                 tasks.append(
@@ -322,12 +282,10 @@ class Database:
                         "created_at": row["created_at"],
                     }
                 )
-
             return tasks
-        except Exception as e:
-            logger.exception("Error in get_user_tasks for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Error in get_user_tasks for %s", user_id)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_all_active_tasks(self) -> List[Dict]:
         conn = self.get_connection()
@@ -335,15 +293,15 @@ class Database:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT user_id, id, label, source_ids, target_ids, settings
+                SELECT user_id, id, label, source_ids, target_ids, settings_json
                 FROM forwarding_tasks
                 WHERE is_active = 1
-            """
+                """
             )
             tasks = []
             for row in cur.fetchall():
                 try:
-                    settings = json.loads(row["settings"]) if row["settings"] else {}
+                    settings = json.loads(row["settings_json"]) if row["settings_json"] else {}
                 except Exception:
                     settings = {}
                 tasks.append(
@@ -357,10 +315,11 @@ class Database:
                     }
                 )
             return tasks
-        except Exception as e:
-            logger.exception("Error in get_all_active_tasks: %s", e)
+        except Exception:
+            logger.exception("Error in get_all_active_tasks")
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
+
+    # ----------------- Allowed users / admins -----------------
 
     def is_user_allowed(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -368,10 +327,9 @@ class Database:
             cur = conn.cursor()
             cur.execute("SELECT user_id FROM allowed_users WHERE user_id = ?", (user_id,))
             return cur.fetchone() is not None
-        except Exception as e:
-            logger.exception("Error in is_user_allowed for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Error in is_user_allowed for %s", user_id)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def is_user_admin(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -380,10 +338,9 @@ class Database:
             cur.execute("SELECT is_admin FROM allowed_users WHERE user_id = ?", (user_id,))
             row = cur.fetchone()
             return row is not None and int(row["is_admin"]) == 1
-        except Exception as e:
-            logger.exception("Error in is_user_admin for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Error in is_user_admin for %s", user_id)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def add_allowed_user(self, user_id: int, username: Optional[str] = None, is_admin: bool = False, added_by: Optional[int] = None) -> bool:
         conn = self.get_connection()
@@ -394,17 +351,16 @@ class Database:
                     """
                     INSERT INTO allowed_users (user_id, username, is_admin, added_by)
                     VALUES (?, ?, ?, ?)
-                """,
+                    """,
                     (user_id, username, 1 if is_admin else 0, added_by),
                 )
                 conn.commit()
                 return True
             except sqlite3.IntegrityError:
                 return False
-        except Exception as e:
-            logger.exception("Error in add_allowed_user for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Error in add_allowed_user for %s", user_id)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def remove_allowed_user(self, user_id: int) -> bool:
         conn = self.get_connection()
@@ -414,10 +370,9 @@ class Database:
             deleted = cur.rowcount > 0
             conn.commit()
             return deleted
-        except Exception as e:
-            logger.exception("Error in remove_allowed_user for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Error in remove_allowed_user for %s", user_id)
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
 
     def get_all_allowed_users(self) -> List[Dict]:
         conn = self.get_connection()
@@ -428,7 +383,7 @@ class Database:
                 SELECT user_id, username, is_admin, added_by, created_at
                 FROM allowed_users
                 ORDER BY created_at DESC
-            """
+                """
             )
             users = []
             for row in cur.fetchall():
@@ -442,20 +397,13 @@ class Database:
                     }
                 )
             return users
-        except Exception as e:
-            logger.exception("Error in get_all_allowed_users: %s", e)
+        except Exception:
+            logger.exception("Error in get_all_allowed_users")
             raise
-        # REMOVED: finally: self.close_connection() - Keep connection open
+
+    # ----------------- DB status -----------------
 
     def get_db_status(self) -> Dict:
-        """
-        Return a small health/status snapshot for the DB:
-        - path
-        - exists
-        - size_bytes
-        - user_version (PRAGMA)
-        - row counts for key tables
-        """
         status = {"path": self.db_path, "exists": False, "size_bytes": None, "user_version": None, "counts": {}}
         try:
             status["exists"] = os.path.exists(self.db_path)
@@ -471,18 +419,15 @@ class Database:
                 try:
                     cur.execute("PRAGMA user_version;")
                     row = cur.fetchone()
-                    # row can be a tuple or sqlite3.Row depending on driver
                     if row:
                         try:
                             status["user_version"] = int(row[0])
                         except Exception:
                             try:
-                                # fallback if row is a mapping
                                 status["user_version"] = int(row["user_version"])
                             except Exception:
                                 status["user_version"] = None
                 except Exception:
-                    # ignore if PRAGMA unsupported
                     status["user_version"] = None
 
                 for table in ("users", "forwarding_tasks", "allowed_users"):
@@ -500,7 +445,7 @@ class Database:
                     except Exception:
                         status["counts"][table] = None
             finally:
-                # Only close connection for status check (not frequently called)
+                # close connection after status read
                 self.close_connection()
         except Exception:
             logger.exception("Error querying DB status")
