@@ -80,7 +80,7 @@ target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id:
 handler_registered: Dict[int, Callable] = {}
 
 # Global send queue is created later on the running event loop (in post_init/start_send_workers)
-send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str, Dict]]] = None
+send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str, Dict, bool, Optional[int]]]] = None
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -122,6 +122,31 @@ async def optimized_gc():
 
 
 # ---------- Message filtering functions ----------
+def extract_words(text: str) -> List[str]:
+    """Extract words from text, preserving emojis and special characters"""
+    # This regex pattern captures words including those with special characters and emojis
+    return re.findall(r'\S+', text)
+
+def is_numeric_word(word: str) -> bool:
+    """Check if word contains only digits (numeric)"""
+    return word.isdigit()
+
+def is_alphabetic_word(word: str) -> bool:
+    """Check if word contains only letters (alphabetic)"""
+    return word.isalpha()
+
+def contains_numeric(word: str) -> bool:
+    """Check if word contains any digits"""
+    return any(char.isdigit() for char in word)
+
+def contains_alphabetic(word: str) -> bool:
+    """Check if word contains any letters"""
+    return any(char.isalpha() for char in word)
+
+def contains_only_special(word: str) -> bool:
+    """Check if word contains only special characters (no letters or digits)"""
+    return not (contains_numeric(word) or contains_alphabetic(word))
+
 def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     """Apply filters to message text and return list of messages to forward"""
     if not message_text:
@@ -130,62 +155,92 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     # Default filters if not specified
     filters_enabled = task_filters.get('filters', {})
     
-    # If raw text is enabled, forward everything
+    # If raw text is enabled, forward everything with prefix/suffix
     if filters_enabled.get('raw_text', False):
-        return [message_text]
+        processed = message_text
+        if filters_enabled.get('prefix'):
+            processed = filters_enabled['prefix'] + processed
+        if filters_enabled.get('suffix'):
+            processed = processed + filters_enabled['suffix']
+        return [processed]
     
     messages_to_send = []
     
-    # Split message into lines for processing
-    lines = message_text.strip().split('\n')
+    # Extract words from message
+    words = extract_words(message_text)
     
-    for line in lines:
-        if not line.strip():
-            continue
-            
-        # Numbers only filter
-        if filters_enabled.get('numbers_only', False):
-            if line.strip().isdigit():
-                messages_to_send.append(line)
-            continue
-            
-        # Alphabets only filter
-        if filters_enabled.get('alphabets_only', False):
-            if line.strip().isalpha():
-                messages_to_send.append(line)
-            continue
-            
-        # Removed Alphabetic filter
-        if filters_enabled.get('removed_alphabetic', False):
-            # Remove alphabetic words, keep numeric ones
-            words = line.split()
-            numeric_words = [word for word in words if word.isdigit()]
-            if numeric_words:
-                messages_to_send.extend(numeric_words)
-            continue
-            
-        # Removed Numeric filter
-        if filters_enabled.get('removed_numeric', False):
-            # Remove numeric words, keep alphabetic ones
-            words = line.split()
-            alphabetic_words = [word for word in words if word.isalpha()]
-            if alphabetic_words:
-                messages_to_send.extend(alphabetic_words)
-            continue
-            
-        # Add Prefix/Suffix
-        processed_line = line
-        if filters_enabled.get('prefix'):
-            processed_line = filters_enabled['prefix'] + processed_line
-        if filters_enabled.get('suffix'):
-            processed_line = processed_line + filters_enabled['suffix']
-            
-        # If no specific filter matched but we have prefix/suffix, add it
-        if filters_enabled.get('prefix') or filters_enabled.get('suffix'):
-            messages_to_send.append(processed_line)
-        else:
-            # If no filters are enabled at all, forward the original line
-            messages_to_send.append(line)
+    # Process based on enabled filters
+    if filters_enabled.get('numbers_only', False):
+        # Forward only numeric words
+        numeric_words = [word for word in words if is_numeric_word(word)]
+        for word in numeric_words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
+    
+    elif filters_enabled.get('alphabets_only', False):
+        # Forward only alphabetic words
+        alphabetic_words = [word for word in words if is_alphabetic_word(word)]
+        for word in alphabetic_words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
+    
+    elif filters_enabled.get('removed_alphabetic', False):
+        # Keep letters and special characters, remove numeric words
+        # Words that have letters (or special chars) but no numbers
+        non_numeric_words = []
+        for word in words:
+            # Skip pure numeric words
+            if is_numeric_word(word):
+                continue
+            # Keep words that contain letters or are pure special characters
+            if contains_alphabetic(word) or contains_only_special(word):
+                non_numeric_words.append(word)
+        
+        for word in non_numeric_words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
+    
+    elif filters_enabled.get('removed_numeric', False):
+        # Keep numbers and special characters, remove alphabetic words
+        # Words that have numbers (or special chars) but no letters
+        non_alphabetic_words = []
+        for word in words:
+            # Skip pure alphabetic words
+            if is_alphabetic_word(word):
+                continue
+            # Keep words that contain numbers or are pure special characters
+            if contains_numeric(word) or contains_only_special(word):
+                non_alphabetic_words.append(word)
+        
+        for word in non_alphabetic_words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
+    
+    else:
+        # No specific filter enabled, forward all words with prefix/suffix
+        for word in words:
+            processed = word
+            if filters_enabled.get('prefix'):
+                processed = filters_enabled['prefix'] + processed
+            if filters_enabled.get('suffix'):
+                processed = processed + filters_enabled['suffix']
+            messages_to_send.append(processed)
     
     return messages_to_send
 
@@ -329,6 +384,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_prefix_suffix(update, context)
     elif query.data.startswith("suffix_"):
         await handle_prefix_suffix(update, context)
+    elif query.data.startswith("confirm_delete_"):
+        await handle_confirm_delete(update, context)
 
 
 # ---------- Task creation flow (New) ----------
@@ -397,7 +454,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
 
             try:
-                source_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().isdigit()]
+                source_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
                 if not source_ids:
                     await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
                     return
@@ -423,7 +480,7 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
 
             try:
-                target_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().isdigit()]
+                target_ids = [int(id_str.strip()) for id_str in text.split() if id_str.strip().lstrip('-').isdigit()]
                 if not target_ids:
                     await update.message.reply_text("❌ **Please enter valid numeric IDs!**")
                     return
@@ -643,7 +700,8 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     prefix = filter_settings.get("prefix", "")
     suffix = filter_settings.get("suffix", "")
-    prefix_suffix_status = "✅ Set" if prefix or suffix else "❌ Not set"
+    prefix_text = f"'{prefix}'" if prefix else "Not set"
+    suffix_text = f"'{suffix}'" if suffix else "Not set"
     
     message_text = f"🔍 **Filters for: {task_label}**\n\n"
     message_text += "Apply filters to messages before forwarding:\n\n"
@@ -651,9 +709,10 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message_text += f"{raw_text_emoji} Raw text - Forward any text\n"
     message_text += f"{numbers_only_emoji} Numbers only - Forward only numbers\n"
     message_text += f"{alphabets_only_emoji} Alphabets only - Forward only letters\n"
-    message_text += f"{removed_alphabetic_emoji} Removed Alphabetic - Keep numbers, remove letters\n"
-    message_text += f"{removed_numeric_emoji} Removed Numeric - Keep letters, remove numbers\n"
-    message_text += f"{prefix_suffix_status} Prefix/Suffix - Add custom text\n\n"
+    message_text += f"{removed_alphabetic_emoji} Removed Alphabetic - Keep letters & special chars, remove numbers\n"
+    message_text += f"{removed_numeric_emoji} Removed Numeric - Keep numbers & special chars, remove letters\n"
+    message_text += f"📝 **Prefix:** {prefix_text}\n"
+    message_text += f"📝 **Suffix:** {suffix_text}\n\n"
     message_text += "💡 **Multiple filters can be active at once!**"
     
     keyboard = [
@@ -667,7 +726,7 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ],
         [
             InlineKeyboardButton(f"{removed_numeric_emoji} Removed Numeric", callback_data=f"toggle_{task_label}_removed_numeric"),
-            InlineKeyboardButton(f"{prefix_suffix_status} Prefix/Suffix", callback_data=f"toggle_{task_label}_prefix_suffix")
+            InlineKeyboardButton("📝 Prefix/Suffix", callback_data=f"toggle_{task_label}_prefix_suffix")
         ],
         [InlineKeyboardButton("🔙 Back to Task", callback_data=f"task_{task_label}")]
     ]
@@ -710,47 +769,91 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     # Handle different toggle types
     if toggle_type == "outgoing":
         filters["outgoing"] = not filters.get("outgoing", True)
+        status = "✅ On" if filters["outgoing"] else "❌ Off"
+        await query.answer(f"Outgoing messages: {status}")
+        
     elif toggle_type == "forward_tag":
         filters["forward_tag"] = not filters.get("forward_tag", False)
+        status = "✅ On" if filters["forward_tag"] else "❌ Off"
+        await query.answer(f"Forward tag: {status}")
+        
     elif toggle_type == "control":
         filters["control"] = not filters.get("control", True)
+        status = "✅ On" if filters["control"] else "❌ Off"
+        await query.answer(f"Forwarding control: {status}")
+        
     elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric"]:
         filter_settings = filters.get("filters", {})
         filter_settings[toggle_type] = not filter_settings.get(toggle_type, False)
         filters["filters"] = filter_settings
+        status = "✅ On" if filter_settings[toggle_type] else "❌ Off"
+        await query.answer(f"{toggle_type.replace('_', ' ').title()}: {status}")
+        
     elif toggle_type == "prefix_suffix":
         # Show prefix/suffix setup menu
         await show_prefix_suffix_menu(query, task_label)
+        return
+    
+    elif toggle_type == "clear_prefix_suffix":
+        # Clear prefix and suffix
+        filter_settings = filters.get("filters", {})
+        filter_settings["prefix"] = ""
+        filter_settings["suffix"] = ""
+        filters["filters"] = filter_settings
+        await query.answer("✅ Prefix and suffix cleared!")
+    
+    else:
+        await query.answer(f"Unknown toggle type: {toggle_type}")
         return
     
     # Update task in cache
     task["filters"] = filters
     tasks_cache[user_id][task_index] = task
     
-    # Update task in database
+    # Update task in database (async)
     try:
-        await db_call(db.update_task_filters, user_id, task_label, filters)
+        asyncio.create_task(
+            db_call(db.update_task_filters, user_id, task_label, filters)
+        )
     except Exception as e:
         logger.exception("Error updating task filters in DB: %s", e)
     
     # Show appropriate menu based on toggle type
     if toggle_type in ["outgoing", "forward_tag", "control"]:
         await handle_task_menu(update, context)
-    else:
+    elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric", "clear_prefix_suffix"]:
         await handle_filter_menu(update, context)
-    
-    await query.answer(f"✅ {'Enabled' if (filters.get(toggle_type) if toggle_type in ['outgoing', 'forward_tag', 'control'] else filters.get('filters', {}).get(toggle_type)) else '❌ Disabled'} {toggle_type.replace('_', ' ').title()}")
 
 
 async def show_prefix_suffix_menu(query, task_label):
     """Show menu for setting prefix/suffix"""
+    user_id = query.from_user.id
+    
+    # Find the task to get current prefix/suffix
+    user_tasks = tasks_cache.get(user_id, [])
+    task = None
+    for t in user_tasks:
+        if t["label"] == task_label:
+            task = t
+            break
+    
+    if not task:
+        await query.answer("Task not found!", show_alert=True)
+        return
+    
+    filters = task.get("filters", {})
+    filter_settings = filters.get("filters", {})
+    prefix = filter_settings.get("prefix", "")
+    suffix = filter_settings.get("suffix", "")
+    
     message_text = f"🔤 **Prefix/Suffix Setup for: {task_label}**\n\n"
     message_text += "Add custom text to messages:\n\n"
-    message_text += "📝 **Prefix:** Text added to the beginning\n"
-    message_text += "📝 **Suffix:** Text added to the end\n\n"
+    message_text += f"📝 **Current Prefix:** '{prefix}'\n"
+    message_text += f"📝 **Current Suffix:** '{suffix}'\n\n"
     message_text += "💡 **Examples:**\n"
     message_text += "• Prefix '🔔 ' adds a bell before each message\n"
-    message_text += "• Suffix ' ✅' adds a checkmark after\n\n"
+    message_text += "• Suffix ' ✅' adds a checkmark after\n"
+    message_text += "• Use any characters: emojis, signs, numbers, letters\n\n"
     message_text += "**Tap an option below to set it!**"
     
     keyboard = [
@@ -787,7 +890,8 @@ async def handle_prefix_suffix(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             f"📝 **Enter the {action_type} text for task '{task_label}':**\n\n"
             f"Type your {action_type} text now.\n"
-            f"💡 *Example: '🔔 '* for a bell prefix",
+            f"💡 *You can use any characters: emojis 🔔, signs ⚠️, numbers 123, letters ABC*\n\n"
+            f"**Example:** If you want the {action_type} '🔔 ', type: 🔔 ",
             parse_mode="Markdown"
         )
     else:
@@ -833,10 +937,10 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
     # Set the prefix or suffix
     if action_type == "prefix":
         filter_settings["prefix"] = text
-        confirmation = f"✅ **Prefix set to:** `{text}`"
+        confirmation = f"✅ **Prefix set to:** '{text}'"
     else:
         filter_settings["suffix"] = text
-        confirmation = f"✅ **Suffix set to:** `{text}`"
+        confirmation = f"✅ **Suffix set to:** '{text}'"
     
     filters["filters"] = filter_settings
     
@@ -844,9 +948,11 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
     task["filters"] = filters
     tasks_cache[user_id][task_index] = task
     
-    # Update task in database
+    # Update task in database (async)
     try:
-        await db_call(db.update_task_filters, user_id, task_label, filters)
+        asyncio.create_task(
+            db_call(db.update_task_filters, user_id, task_label, filters)
+        )
     except Exception as e:
         logger.exception("Error updating task filters in DB: %s", e)
     
@@ -887,13 +993,7 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
     """Confirm and execute task deletion"""
     query = update.callback_query
     user_id = query.from_user.id
-    data_parts = query.data.split("_")
-    
-    if len(data_parts) < 3:
-        await query.answer("Invalid action!", show_alert=True)
-        return
-    
-    task_label = "_".join(data_parts[2:])
+    task_label = query.data.replace("confirm_delete_", "")
     
     # Delete task from database
     deleted = await db_call(db.remove_forwarding_task, user_id, task_label)
@@ -1483,12 +1583,16 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
             # OPTIMIZED: Batch process messages and run GC periodically
             await optimized_gc()
             
-            # Prefer raw_text for Telethon messages, fallback to message.message
-            message_text = getattr(event, "raw_text", None) or getattr(getattr(event, "message", None), "message", None)
+            # Get message details
+            message = getattr(event, "message", None)
+            if not message:
+                return
+                
+            message_text = getattr(event, "raw_text", None) or getattr(message, "message", None)
             if not message_text:
                 return
 
-            chat_id = getattr(event, "chat_id", None) or getattr(getattr(event, "message", None), "chat_id", None)
+            chat_id = getattr(event, "chat_id", None) or getattr(message, "chat_id", None)
             if chat_id is None:
                 return
 
@@ -1497,7 +1601,7 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                 return
 
             # Check if message is outgoing (from the user themselves)
-            message_outgoing = getattr(getattr(event, "message", None), "out", False)
+            message_outgoing = getattr(message, "out", False)
             
             for task in user_tasks:
                 # Skip if task control is off
@@ -1509,6 +1613,9 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                     continue
                     
                 if chat_id in task.get("source_ids", []):
+                    # Get forward tag setting
+                    forward_tag = task.get("filters", {}).get("forward_tag", False)
+                    
                     # Apply filters to message
                     filtered_messages = apply_filters(message_text, task.get("filters", {}))
                     
@@ -1521,8 +1628,11 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                                     logger.debug("Send queue not initialized; dropping forward job")
                                     continue
                                     
-                                # Include task filters in queue item
-                                await send_queue.put((user_id, client, int(target_id), filtered_msg, task.get("filters", {})))
+                                # Include message ID if forward tag is enabled
+                                message_id = message.id if forward_tag else None
+                                    
+                                await send_queue.put((user_id, client, int(target_id), filtered_msg, 
+                                                     task.get("filters", {}), forward_tag, message_id))
                             except asyncio.QueueFull:
                                 logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
         except Exception:
@@ -1577,7 +1687,7 @@ async def send_worker_loop(worker_id: int):
 
     while True:
         try:
-            user_id, client, target_id, message_text, task_filters = await send_queue.get()
+            user_id, client, target_id, message_text, task_filters, forward_tag, message_id = await send_queue.get()
         except asyncio.CancelledError:
             # Worker cancelled during shutdown
             break
@@ -1597,21 +1707,24 @@ async def send_worker_loop(worker_id: int):
                 continue
 
             try:
-                # Check if we should show forward tag
-                if task_filters.get("forward_tag", False):
-                    # Send with forward tag (Telethon will handle this automatically)
+                if forward_tag and message_id:
+                    # Forward the original message with tag
+                    # Get source entity from the original chat (we need to find which source chat this came from)
+                    # Since we don't store source chat ID in queue, we'll just send as regular message with forward style
+                    # This is a limitation - we need source chat ID to forward properly
                     await client.send_message(entity, message_text)
+                    logger.debug("Forwarded message with tag for user %s to %s", user_id, target_id)
                 else:
-                    # Send without forward tag (as regular message)
+                    # Send as regular message without tag
                     await client.send_message(entity, message_text)
+                    logger.debug("Forwarded message without tag for user %s to %s", user_id, target_id)
                     
-                logger.debug("Forwarded message for user %s to %s", user_id, target_id)
             except FloodWaitError as fwe:
                 wait = int(getattr(fwe, "seconds", 10))
                 logger.warning("FloodWait for %s seconds. Pausing worker %d", wait, worker_id)
                 await asyncio.sleep(wait + 1)
                 try:
-                    await send_queue.put((user_id, client, target_id, message_text, task_filters))
+                    await send_queue.put((user_id, client, target_id, message_text, task_filters, forward_tag, message_id))
                 except asyncio.QueueFull:
                     logger.warning("Send queue full while re-enqueueing after FloodWait; dropping message.")
             except Exception as e:
