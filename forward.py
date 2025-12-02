@@ -80,7 +80,7 @@ target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id:
 handler_registered: Dict[int, Callable] = {}
 
 # Global send queue is created later on the running event loop (in post_init/start_send_workers)
-send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str, Dict, bool, Optional[int]]]] = None
+send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str, Dict, bool, Optional[int], Optional[int]]]] = None
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -770,24 +770,20 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     if toggle_type == "outgoing":
         filters["outgoing"] = not filters.get("outgoing", True)
         status = "✅ On" if filters["outgoing"] else "❌ Off"
-        await query.answer(f"Outgoing messages: {status}")
         
     elif toggle_type == "forward_tag":
         filters["forward_tag"] = not filters.get("forward_tag", False)
         status = "✅ On" if filters["forward_tag"] else "❌ Off"
-        await query.answer(f"Forward tag: {status}")
         
     elif toggle_type == "control":
         filters["control"] = not filters.get("control", True)
         status = "✅ On" if filters["control"] else "❌ Off"
-        await query.answer(f"Forwarding control: {status}")
         
     elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric"]:
         filter_settings = filters.get("filters", {})
         filter_settings[toggle_type] = not filter_settings.get(toggle_type, False)
         filters["filters"] = filter_settings
         status = "✅ On" if filter_settings[toggle_type] else "❌ Off"
-        await query.answer(f"{toggle_type.replace('_', ' ').title()}: {status}")
         
     elif toggle_type == "prefix_suffix":
         # Show prefix/suffix setup menu
@@ -800,7 +796,7 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         filter_settings["prefix"] = ""
         filter_settings["suffix"] = ""
         filters["filters"] = filter_settings
-        await query.answer("✅ Prefix and suffix cleared!")
+        status = "Prefix/suffix cleared!"
     
     else:
         await query.answer(f"Unknown toggle type: {toggle_type}")
@@ -823,6 +819,9 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         await handle_task_menu(update, context)
     elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric", "clear_prefix_suffix"]:
         await handle_filter_menu(update, context)
+    
+    # Show immediate feedback
+    await query.answer(status)
 
 
 async def show_prefix_suffix_menu(query, task_label):
@@ -1628,11 +1627,16 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
                                     logger.debug("Send queue not initialized; dropping forward job")
                                     continue
                                     
-                                # Include message ID if forward tag is enabled
-                                message_id = message.id if forward_tag else None
+                                # Include original message ID and source chat ID if forward tag is enabled
+                                if forward_tag:
+                                    # Store original message for forwarding with tag
+                                    await send_queue.put((user_id, client, int(target_id), message_text, 
+                                                         task.get("filters", {}), forward_tag, message.id, chat_id))
+                                else:
+                                    # Send filtered message without tag
+                                    await send_queue.put((user_id, client, int(target_id), filtered_msg, 
+                                                         task.get("filters", {}), forward_tag, None, None))
                                     
-                                await send_queue.put((user_id, client, int(target_id), filtered_msg, 
-                                                     task.get("filters", {}), forward_tag, message_id))
                             except asyncio.QueueFull:
                                 logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
         except Exception:
@@ -1687,7 +1691,7 @@ async def send_worker_loop(worker_id: int):
 
     while True:
         try:
-            user_id, client, target_id, message_text, task_filters, forward_tag, message_id = await send_queue.get()
+            user_id, client, target_id, message_text, task_filters, forward_tag, message_id, source_chat_id = await send_queue.get()
         except asyncio.CancelledError:
             # Worker cancelled during shutdown
             break
@@ -1707,13 +1711,19 @@ async def send_worker_loop(worker_id: int):
                 continue
 
             try:
-                if forward_tag and message_id:
+                if forward_tag and message_id and source_chat_id:
                     # Forward the original message with tag
-                    # Get source entity from the original chat (we need to find which source chat this came from)
-                    # Since we don't store source chat ID in queue, we'll just send as regular message with forward style
-                    # This is a limitation - we need source chat ID to forward properly
-                    await client.send_message(entity, message_text)
-                    logger.debug("Forwarded message with tag for user %s to %s", user_id, target_id)
+                    try:
+                        # Get the source entity
+                        source_entity = await client.get_input_entity(int(source_chat_id))
+                        
+                        # Forward the original message
+                        await client.forward_messages(entity, message_id, source_entity)
+                        logger.debug("Forwarded message with tag for user %s to %s", user_id, target_id)
+                    except Exception as e:
+                        logger.warning("Failed to forward with tag, sending as regular message: %s", e)
+                        # Fallback to regular message
+                        await client.send_message(entity, message_text)
                 else:
                     # Send as regular message without tag
                     await client.send_message(entity, message_text)
@@ -1724,7 +1734,7 @@ async def send_worker_loop(worker_id: int):
                 logger.warning("FloodWait for %s seconds. Pausing worker %d", wait, worker_id)
                 await asyncio.sleep(wait + 1)
                 try:
-                    await send_queue.put((user_id, client, target_id, message_text, task_filters, forward_tag, message_id))
+                    await send_queue.put((user_id, client, target_id, message_text, task_filters, forward_tag, message_id, source_chat_id))
                 except asyncio.QueueFull:
                     logger.warning("Send queue full while re-enqueueing after FloodWait; dropping message.")
             except Exception as e:
