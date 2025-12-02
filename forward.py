@@ -80,7 +80,7 @@ target_entity_cache: Dict[int, Dict[int, object]] = {}  # user_id -> {target_id:
 handler_registered: Dict[int, Callable] = {}
 
 # Global send queue is created later on the running event loop (in post_init/start_send_workers)
-send_queue: Optional[asyncio.Queue[Tuple[int, TelegramClient, int, str, Dict, bool, Optional[int], Optional[int]]]] = None
+send_queue: Optional[asyncio.Queue] = None
 
 UNAUTHORIZED_MESSAGE = """🚫 **Access Denied!** 
 
@@ -124,7 +124,6 @@ async def optimized_gc():
 # ---------- Message filtering functions ----------
 def extract_words(text: str) -> List[str]:
     """Extract words from text, preserving emojis and special characters"""
-    # This regex pattern captures words including those with special characters and emojis
     return re.findall(r'\S+', text)
 
 def is_numeric_word(word: str) -> bool:
@@ -152,7 +151,6 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
     if not message_text:
         return []
     
-    # Default filters if not specified
     filters_enabled = task_filters.get('filters', {})
     
     # If raw text is enabled, forward everything with prefix/suffix
@@ -165,13 +163,10 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
         return [processed]
     
     messages_to_send = []
-    
-    # Extract words from message
     words = extract_words(message_text)
     
     # Process based on enabled filters
     if filters_enabled.get('numbers_only', False):
-        # Forward only numeric words
         numeric_words = [word for word in words if is_numeric_word(word)]
         for word in numeric_words:
             processed = word
@@ -182,7 +177,6 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             messages_to_send.append(processed)
     
     elif filters_enabled.get('alphabets_only', False):
-        # Forward only alphabetic words
         alphabetic_words = [word for word in words if is_alphabetic_word(word)]
         for word in alphabetic_words:
             processed = word
@@ -193,14 +187,10 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             messages_to_send.append(processed)
     
     elif filters_enabled.get('removed_alphabetic', False):
-        # Keep letters and special characters, remove numeric words
-        # Words that have letters (or special chars) but no numbers
         non_numeric_words = []
         for word in words:
-            # Skip pure numeric words
             if is_numeric_word(word):
                 continue
-            # Keep words that contain letters or are pure special characters
             if contains_alphabetic(word) or contains_only_special(word):
                 non_numeric_words.append(word)
         
@@ -213,14 +203,10 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
             messages_to_send.append(processed)
     
     elif filters_enabled.get('removed_numeric', False):
-        # Keep numbers and special characters, remove alphabetic words
-        # Words that have numbers (or special chars) but no letters
         non_alphabetic_words = []
         for word in words:
-            # Skip pure alphabetic words
             if is_alphabetic_word(word):
                 continue
-            # Keep words that contain numbers or are pure special characters
             if contains_numeric(word) or contains_only_special(word):
                 non_alphabetic_words.append(word)
         
@@ -249,7 +235,6 @@ def apply_filters(message_text: str, task_filters: Dict) -> List[str]:
 async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
 
-    # Allow if user present in DB allowed list OR configured via env lists (ALLOWED_USERS or OWNER_IDS)
     try:
         is_allowed_db = await db_call(db.is_user_allowed, user_id)
     except Exception:
@@ -277,7 +262,7 @@ async def check_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
     return True
 
 
-# ---------- Simple UI handlers (left mostly unchanged) ----------
+# ---------- Simple UI handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -338,7 +323,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         keyboard.append([InlineKeyboardButton("🟢 Connect Account", callback_data="login")])
 
-    # safe: update.message is present for /start
     await update.message.reply_text(
         message_text,
         reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
@@ -388,7 +372,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_confirm_delete(update, context)
 
 
-# ---------- Task creation flow (New) ----------
+# ---------- Task creation flow ----------
 async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the interactive task creation process"""
     user_id = update.effective_user.id
@@ -404,7 +388,6 @@ async def forwadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Start task creation process
     task_creation_states[user_id] = {
         "step": "waiting_name",
         "name": "",
@@ -487,7 +470,6 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
 
                 state["target_ids"] = target_ids
 
-                # Create the task with default filters
                 task_filters = {
                     "filters": {
                         "raw_text": False,
@@ -498,9 +480,9 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                         "prefix": "",
                         "suffix": ""
                     },
-                    "outgoing": True,      # ✅ On by default
-                    "forward_tag": False,   # ❌ Off by default (no tag)
-                    "control": True        # ✅ On by default (running)
+                    "outgoing": True,
+                    "forward_tag": False,
+                    "control": True
                 }
 
                 added = await db_call(db.add_forwarding_task, 
@@ -511,7 +493,6 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                                      task_filters)
 
                 if added:
-                    # Update in-memory cache
                     tasks_cache.setdefault(user_id, [])
                     tasks_cache[user_id].append({
                         "id": None,
@@ -522,13 +503,11 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                         "filters": task_filters
                     })
 
-                    # Schedule async resolve of target entities
                     try:
                         asyncio.create_task(resolve_targets_for_user(user_id, target_ids))
                     except Exception:
                         logger.exception("Failed to schedule resolve_targets_for_user task")
 
-                    # Send success message
                     await update.message.reply_text(
                         f"🎉 **Task created successfully!**\n\n"
                         f"📋 **Name:** {state['name']}\n"
@@ -542,7 +521,6 @@ async def handle_task_creation(update: Update, context: ContextTypes.DEFAULT_TYP
                         parse_mode="Markdown"
                     )
 
-                    # Clean up state
                     del task_creation_states[user_id]
 
                 else:
@@ -575,8 +553,6 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     message = update.message if update.message else update.callback_query.message
-
-    # Use in-memory cache for fast response
     tasks = tasks_cache.get(user_id) or []
 
     if not tasks:
@@ -599,7 +575,6 @@ async def fortasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_list += f"   📥 Sources: {', '.join(map(str, task['source_ids']))}\n"
         task_list += f"   📤 Targets: {', '.join(map(str, task['target_ids']))}\n\n"
         
-        # Add task as clickable button
         keyboard.append([InlineKeyboardButton(f"{i}. {task['label']}", callback_data=f"task_{task['label']}")])
 
     task_list += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -619,7 +594,6 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     task_label = query.data.replace("task_", "")
     
-    # Find the task
     user_tasks = tasks_cache.get(user_id, [])
     task = None
     for t in user_tasks:
@@ -631,11 +605,8 @@ async def handle_task_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Task not found!", show_alert=True)
         return
     
-    # Get current filter states
     filters = task.get("filters", {})
-    filter_settings = filters.get("filters", {})
     
-    # Build status emojis
     outgoing_emoji = "✅" if filters.get("outgoing", True) else "❌"
     forward_tag_emoji = "✅" if filters.get("forward_tag", False) else "❌"
     control_emoji = "✅" if filters.get("control", True) else "❌"
@@ -675,7 +646,6 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = query.from_user.id
     task_label = query.data.replace("filter_", "")
     
-    # Find the task
     user_tasks = tasks_cache.get(user_id, [])
     task = None
     for t in user_tasks:
@@ -687,11 +657,9 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Task not found!", show_alert=True)
         return
     
-    # Get current filter states
     filters = task.get("filters", {})
     filter_settings = filters.get("filters", {})
     
-    # Build emojis for each filter
     raw_text_emoji = "✅" if filter_settings.get("raw_text", False) else "❌"
     numbers_only_emoji = "✅" if filter_settings.get("numbers_only", False) else "❌"
     alphabets_only_emoji = "✅" if filter_settings.get("alphabets_only", False) else "❌"
@@ -751,7 +719,6 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     task_label = data_parts[0]
     toggle_type = "_".join(data_parts[1:])
     
-    # Find the task
     user_tasks = tasks_cache.get(user_id, [])
     task_index = -1
     for i, t in enumerate(user_tasks):
@@ -766,7 +733,6 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     task = user_tasks[task_index]
     filters = task.get("filters", {})
     
-    # Handle different toggle types
     if toggle_type == "outgoing":
         filters["outgoing"] = not filters.get("outgoing", True)
         status = "✅ On" if filters["outgoing"] else "❌ Off"
@@ -790,12 +756,10 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer(f"{toggle_type.replace('_', ' ').title()}: {status}")
         
     elif toggle_type == "prefix_suffix":
-        # Show prefix/suffix setup menu
         await show_prefix_suffix_menu(query, task_label)
         return
     
     elif toggle_type == "clear_prefix_suffix":
-        # Clear prefix and suffix
         filter_settings = filters.get("filters", {})
         filter_settings["prefix"] = ""
         filter_settings["suffix"] = ""
@@ -806,11 +770,9 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer(f"Unknown toggle type: {toggle_type}")
         return
     
-    # Update task in cache
     task["filters"] = filters
     tasks_cache[user_id][task_index] = task
     
-    # Update task in database (async)
     try:
         asyncio.create_task(
             db_call(db.update_task_filters, user_id, task_label, filters)
@@ -818,7 +780,6 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logger.exception("Error updating task filters in DB: %s", e)
     
-    # Show appropriate menu based on toggle type
     if toggle_type in ["outgoing", "forward_tag", "control"]:
         await handle_task_menu(update, context)
     elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric", "clear_prefix_suffix"]:
@@ -829,7 +790,6 @@ async def show_prefix_suffix_menu(query, task_label):
     """Show menu for setting prefix/suffix"""
     user_id = query.from_user.id
     
-    # Find the task to get current prefix/suffix
     user_tasks = tasks_cache.get(user_id, [])
     task = None
     for t in user_tasks:
@@ -880,12 +840,11 @@ async def handle_prefix_suffix(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Invalid action!", show_alert=True)
         return
     
-    action_type = data_parts[0]  # prefix or suffix
+    action_type = data_parts[0]
     task_label = data_parts[1]
     action = data_parts[2] if len(data_parts) > 2 else ""
     
     if action == "set":
-        # Store state and ask for input
         context.user_data[f"waiting_{action_type}"] = task_label
         await query.edit_message_text(
             f"📝 **Enter the {action_type} text for task '{task_label}':**\n\n"
@@ -903,7 +862,6 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
-    # Check if we're waiting for prefix or suffix
     waiting_prefix = context.user_data.get("waiting_prefix")
     waiting_suffix = context.user_data.get("waiting_suffix")
     
@@ -918,7 +876,6 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
     else:
         return
     
-    # Find the task
     user_tasks = tasks_cache.get(user_id, [])
     task_index = -1
     for i, t in enumerate(user_tasks):
@@ -934,7 +891,6 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
     filters = task.get("filters", {})
     filter_settings = filters.get("filters", {})
     
-    # Set the prefix or suffix
     if action_type == "prefix":
         filter_settings["prefix"] = text
         confirmation = f"✅ **Prefix set to:** '{text}'"
@@ -943,12 +899,9 @@ async def handle_prefix_suffix_input(update: Update, context: ContextTypes.DEFAU
         confirmation = f"✅ **Suffix set to:** '{text}'"
     
     filters["filters"] = filter_settings
-    
-    # Update task in cache
     task["filters"] = filters
     tasks_cache[user_id][task_index] = task
     
-    # Update task in database (async)
     try:
         asyncio.create_task(
             db_call(db.update_task_filters, user_id, task_label, filters)
@@ -995,11 +948,9 @@ async def handle_confirm_delete(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
     task_label = query.data.replace("confirm_delete_", "")
     
-    # Delete task from database
     deleted = await db_call(db.remove_forwarding_task, user_id, task_label)
     
     if deleted:
-        # Update in-memory cache
         if user_id in tasks_cache:
             tasks_cache[user_id] = [t for t in tasks_cache[user_id] if t.get("label") != task_label]
         
@@ -1024,7 +975,6 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message if update.message else update.callback_query.message
 
-    # OPTIMIZED: Check current user count
     if len(user_clients) >= MAX_CONCURRENT_USERS:
         await message.reply_text(
             "❌ **Server at capacity!**\n\n"
@@ -1033,7 +983,6 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Check if user is already logged in
     user = await db_call(db.get_user, user_id)
     if user and user.get("is_logged_in"):
         await message.reply_text(
@@ -1045,19 +994,13 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    client = TelegramClient(
-        StringSession(), 
-        API_ID, 
-        API_HASH,
-        device_model="ForwardBot",
-        system_version="1.0",
-        app_version="1.0",
-        lang_code="en"
-    )
+    # FIXED: Simplified Telethon client initialization
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
     
     try:
         await client.connect()
     except Exception as e:
+        logger.error(f"Telethon connection failed: {e}")
         await message.reply_text(
             f"❌ **Connection failed:** {str(e)}\n\n"
             "Please try again in a few minutes.",
@@ -1090,7 +1033,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # First check if we're in task creation
+    # Check if we're in task creation
     if user_id in task_creation_states:
         await handle_task_creation(update, context)
         return
@@ -1114,7 +1057,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         if state["step"] == "waiting_phone":
-            # Validate phone number format
             if not text.startswith('+'):
                 await update.message.reply_text(
                     "❌ **Invalid format!**\n\n"
@@ -1125,7 +1067,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 return
             
-            # Clean phone number (remove spaces, dashes, parentheses)
             clean_phone = ''.join(c for c in text if c.isdigit() or c == '+')
             
             if len(clean_phone) < 8:
@@ -1144,54 +1085,35 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
             try:
-                # Try to send code request with force_sms if available, else fallback.
-                try:
-                    result = await client.send_code_request(clean_phone, force_sms=True)
-                    logger.info("send_code_request(force_sms=True) returned for %s: %r", clean_phone, result)
-                except TypeError:
-                    # Telethon version may not accept force_sms kwarg
-                    result = await client.send_code_request(clean_phone)
-                    logger.info("send_code_request (no force_sms kw) returned for %s: %r", clean_phone, result)
-                except Exception as e:
-                    # If force_sms raised, attempt fallback without force_sms
-                    logger.warning("send_code_request(force_sms=True) raised for %s: %s. Trying without force_sms.", clean_phone, e)
-                    try:
-                        result = await client.send_code_request(clean_phone)
-                        logger.info("send_code_request (fallback without force_sms) returned for %s: %r", clean_phone, result)
-                    except Exception as e2:
-                        logger.exception("Error sending code for user %s: %s", user_id, e2)
-                        raise e2
-
+                logger.info(f"Sending code request to {clean_phone}")
+                result = await client.send_code_request(clean_phone)
+                logger.info(f"Code request result received for {clean_phone}")
+                
                 state["phone"] = clean_phone
-                # phone_code_hash may be on the returned object in different attributes; try to extract safely
-                phone_code_hash = getattr(result, "phone_code_hash", None) or getattr(result, "phone_code_hash", None)
-                state["phone_code_hash"] = phone_code_hash
+                state["phone_code_hash"] = result.phone_code_hash
                 state["step"] = "waiting_code"
 
-                logger.info("Code request successful for user %s phone=%s phone_code_hash=%s", user_id, clean_phone, phone_code_hash)
-
                 await processing_msg.edit_text(
-                    "✅ **Verification code sent!**\n\n"
-                    "📱 **Code sent to:** `{}`\n\n"
+                    f"✅ **Verification code sent!**\n\n"
+                    f"📱 **Code sent to:** `{clean_phone}`\n\n"
                     "2️⃣ **Enter the verification code:**\n\n"
                     "**Format:** `verify12345`\n"
-                    "• Type `verify` followed by your code (digits only)\n"
+                    "• Type `verify` followed by your 5-digit code\n"
                     "• No spaces, no brackets\n\n"
                     "**Example:** If your code is `54321`, type:\n"
                     "`verify54321`\n\n"
                     "⚠️ **If you don't receive the code:**\n"
-                    "1. Check your Telegram app notifications (code might arrive there)\n"
+                    "1. Check your Telegram app notifications\n"
                     "2. Wait 2-3 minutes\n"
                     "3. Check spam messages\n"
-                    "4. Try login via Telegram app first".format(clean_phone),
+                    "4. Try login via Telegram app first",
                     parse_mode="Markdown",
                 )
 
             except Exception as e:
                 error_msg = str(e)
-                logger.exception("Error sending code for user %s: %s", user_id, error_msg)
+                logger.error(f"Error sending code for user {user_id}: {error_msg}")
                 
-                # Handle specific error cases
                 if "PHONE_NUMBER_INVALID" in error_msg:
                     error_text = "❌ **Invalid phone number!**\n\nPlease check the format and try again."
                 elif "PHONE_NUMBER_BANNED" in error_msg:
@@ -1208,7 +1130,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                     parse_mode="Markdown",
                 )
                 
-                # Clean up on error
                 try:
                     await client.disconnect()
                 except:
@@ -1223,19 +1144,27 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text(
                     "❌ **Invalid format!**\n\n"
                     "Please use the format: `verify12345`\n\n"
-                    "Type `verify` followed immediately by your code (digits only).\n"
+                    "Type `verify` followed immediately by your 5-digit code.\n"
                     "**Example:** `verify54321`",
                     parse_mode="Markdown",
                 )
                 return
 
-            code = text[6:]  # Remove "verify" prefix
+            code = text[6:]
             
-            # Validate code format - accept variable length numeric codes (no rigid 5-digit requirement)
             if not code or not code.isdigit():
                 await update.message.reply_text(
                     "❌ **Invalid code!**\n\n"
                     "Code must contain only digits.\n"
+                    "**Example:** `verify12345`",
+                    parse_mode="Markdown",
+                )
+                return
+            
+            if len(code) != 5:
+                await update.message.reply_text(
+                    "❌ **Code must be 5 digits!**\n\n"
+                    f"Your code has {len(code)} digits. Please check and try again.\n"
                     "**Example:** `verify12345`",
                     parse_mode="Markdown",
                 )
@@ -1247,7 +1176,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
             try:
-                await client.sign_in(state["phone"], code, phone_code_hash=state.get("phone_code_hash"))
+                await client.sign_in(state["phone"], code, phone_code_hash=state["phone_code_hash"])
 
                 me = await client.get_me()
                 session_string = client.session.save()
@@ -1255,7 +1184,6 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 await db_call(db.save_user, user_id, state["phone"], me.first_name, session_string, True)
 
                 user_clients[user_id] = client
-                # ensure caches exist
                 tasks_cache.setdefault(user_id, [])
                 target_entity_cache.setdefault(user_id, {})
                 await start_forwarding_for_user(user_id)
@@ -1290,7 +1218,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             except Exception as e:
                 error_msg = str(e)
-                logger.exception("Error verifying code for user %s: %s", user_id, error_msg)
+                logger.error(f"Error verifying code for user {user_id}: {error_msg}")
                 
                 if "PHONE_CODE_INVALID" in error_msg:
                     error_text = "❌ **Invalid code!**\n\nPlease check the code and try again."
@@ -1315,7 +1243,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 return
 
-            password = text[8:]  # Remove "password" prefix
+            password = text[8:]
 
             if not password:
                 await update.message.reply_text(
@@ -1361,7 +1289,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 
             except Exception as e:
                 error_msg = str(e)
-                logger.exception("Error verifying 2FA for user %s: %s", user_id, error_msg)
+                logger.error(f"Error verifying 2FA for user {user_id}: {error_msg}")
                 
                 if "PASSWORD_HASH_INVALID" in error_msg or "PASSWORD_INVALID" in error_msg:
                     error_text = "❌ **Invalid 2FA password!**\n\nPlease check your password and try again."
@@ -1383,13 +1311,13 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         if user_id in login_states:
             try:
-                # ensure Telethon client disconnected if login failed
                 c = login_states[user_id].get("client")
                 if c:
                     await c.disconnect()
             except Exception:
                 logger.exception("Error disconnecting client after failed login for %s", user_id)
             del login_states[user_id]
+
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
@@ -1436,11 +1364,9 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         )
         return True
 
-    # Disconnect client's telethon session (if present)
     if user_id in user_clients:
         client = user_clients[user_id]
         try:
-            # remove handler if present
             handler = handler_registered.get(user_id)
             if handler:
                 try:
@@ -1455,12 +1381,11 @@ async def handle_logout_confirmation(update: Update, context: ContextTypes.DEFAU
         finally:
             user_clients.pop(user_id, None)
 
-    # mark as logged out in DB
     try:
         await db_call(db.save_user, user_id, None, None, None, False)
     except Exception:
         logger.exception("Error saving user logout state for %s", user_id)
-    # clear caches for this user
+    
     tasks_cache.pop(user_id, None)
     target_entity_cache.pop(user_id, None)
     logout_states.pop(user_id, None)
@@ -1527,7 +1452,6 @@ async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ **User added!**\n\nID: `{new_user_id}`\nRole: {role}",
                 parse_mode="Markdown",
             )
-            # notify the added user (best-effort)
             try:
                 await context.bot.send_message(new_user_id, "✅ You have been added. Send /start to begin.", parse_mode="Markdown")
             except Exception:
@@ -1562,11 +1486,9 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         removed = await db_call(db.remove_allowed_user, remove_user_id)
         if removed:
-            # Best-effort: disconnect user's Telethon client and clear in-memory state
             if remove_user_id in user_clients:
                 try:
                     client = user_clients[remove_user_id]
-                    # remove event handler if present
                     handler = handler_registered.get(remove_user_id)
                     if handler:
                         try:
@@ -1581,7 +1503,6 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 finally:
                     user_clients.pop(remove_user_id, None)
 
-            # mark as logged out in users table and clear caches
             try:
                 await db_call(db.save_user, remove_user_id, None, None, None, False)
             except Exception:
@@ -1593,7 +1514,6 @@ async def removeuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             await update.message.reply_text(f"✅ **User `{remove_user_id}` removed!**", parse_mode="Markdown")
 
-            # Notify removed user (best-effort)
             try:
                 await context.bot.send_message(remove_user_id, "❌ You have been removed. Contact the owner to regain access.", parse_mode="Markdown")
             except Exception:
@@ -1740,18 +1660,16 @@ async def show_categorized_chats(user_id: int, chat_id: int, message_id: int, ca
     await context.bot.edit_message_text(chat_list, chat_id=chat_id, message_id=message_id, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
-# ---------- OPTIMIZED Forwarding core: handler registration, message handler, send worker, resolver ----------
+# ---------- OPTIMIZED Forwarding core ----------
 def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
-    """Attach a NewMessage handler once per client/user to avoid duplicates and store the handler (so it can be removed)."""
+    """Attach a NewMessage handler once per client/user to avoid duplicates."""
     if handler_registered.get(user_id):
         return
 
     async def _hot_message_handler(event):
         try:
-            # OPTIMIZED: Batch process messages and run GC periodically
             await optimized_gc()
             
-            # Get message details
             message = getattr(event, "message", None)
             if not message:
                 return
@@ -1768,38 +1686,30 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
             if not user_tasks:
                 return
 
-            # Check if message is outgoing (from the user themselves)
             message_outgoing = getattr(message, "out", False)
             
             for task in user_tasks:
-                # Skip if task control is off
                 if not task.get("filters", {}).get("control", True):
                     continue
                     
-                # Skip if message is outgoing and outgoing filter is off
                 if message_outgoing and not task.get("filters", {}).get("outgoing", True):
                     continue
                     
                 if chat_id in task.get("source_ids", []):
-                    # Get forward tag setting
                     forward_tag = task.get("filters", {}).get("forward_tag", False)
-                    
-                    # Apply filters to message
                     filtered_messages = apply_filters(message_text, task.get("filters", {}))
                     
                     for filtered_msg in filtered_messages:
                         for target_id in task.get("target_ids", []):
                             try:
-                                # ensure send_queue exists and is on running loop
                                 global send_queue
                                 if send_queue is None:
                                     logger.debug("Send queue not initialized; dropping forward job")
                                     continue
                                     
-                                # Pass source chat ID and message ID for forwarding
                                 await send_queue.put((user_id, client, int(target_id), filtered_msg, 
                                                      task.get("filters", {}), forward_tag, 
-                                                     chat_id if forward_tag else None,  # Add source chat ID
+                                                     chat_id if forward_tag else None,
                                                      message.id if forward_tag else None))
                             except asyncio.QueueFull:
                                 logger.warning("Send queue full, dropping forward job for user=%s target=%s", user_id, target_id)
@@ -1815,7 +1725,7 @@ def ensure_handler_registered_for_user(user_id: int, client: TelegramClient):
 
 
 async def resolve_target_entity_once(user_id: int, client: TelegramClient, target_id: int) -> Optional[object]:
-    """Try to resolve a target entity and cache it. Returns entity or None."""
+    """Try to resolve a target entity and cache it."""
     if user_id not in target_entity_cache:
         target_entity_cache[user_id] = {}
 
@@ -1846,7 +1756,7 @@ async def resolve_targets_for_user(user_id: int, target_ids: List[int]):
 
 
 async def send_worker_loop(worker_id: int):
-    """OPTIMIZED Worker that consumes send_queue and performs client.send_message with backoff on FloodWait."""
+    """Worker that consumes send_queue and performs client.send_message with backoff."""
     logger.info("Send worker %d started", worker_id)
     global send_queue
     if send_queue is None:
@@ -1855,13 +1765,10 @@ async def send_worker_loop(worker_id: int):
 
     while True:
         try:
-            # Updated to include source_chat_id
             user_id, client, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id = await send_queue.get()
         except asyncio.CancelledError:
-            # Worker cancelled during shutdown
             break
         except Exception:
-            # if loop closed or other error
             logger.exception("Error getting item from send_queue in worker %d", worker_id)
             break
 
@@ -1877,18 +1784,14 @@ async def send_worker_loop(worker_id: int):
 
             try:
                 if forward_tag and source_chat_id and message_id:
-                    # Forward the original message with tag
                     try:
                         source_entity = await client.get_input_entity(int(source_chat_id))
-                        # Forward the original message
                         await client.forward_messages(entity, message_id, source_entity)
                         logger.debug("Forwarded message with tag for user %s to %s", user_id, target_id)
                     except Exception as e:
                         logger.warning("Failed to forward with tag, falling back to regular send: %s", e)
-                        # Fallback to regular message if forwarding fails
                         await client.send_message(entity, message_text)
                 else:
-                    # Send as regular message without tag
                     await client.send_message(entity, message_text)
                     logger.debug("Forwarded message without tag for user %s to %s", user_id, target_id)
                     
@@ -1897,7 +1800,6 @@ async def send_worker_loop(worker_id: int):
                 logger.warning("FloodWait for %s seconds. Pausing worker %d", wait, worker_id)
                 await asyncio.sleep(wait + 1)
                 try:
-                    # Update queue put with correct number of arguments
                     await send_queue.put((user_id, client, target_id, message_text, task_filters, forward_tag, source_chat_id, message_id))
                 except asyncio.QueueFull:
                     logger.warning("Send queue full while re-enqueueing after FloodWait; dropping message.")
@@ -1910,7 +1812,6 @@ async def send_worker_loop(worker_id: int):
             try:
                 send_queue.task_done()
             except Exception:
-                # If queue or loop closed, ignore
                 pass
 
 
@@ -1919,7 +1820,6 @@ async def start_send_workers():
     if _send_workers_started:
         return
 
-    # create queue on the current running loop (safe)
     if send_queue is None:
         send_queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
 
@@ -1943,11 +1843,10 @@ async def start_forwarding_for_user(user_id: int):
     ensure_handler_registered_for_user(user_id, client)
 
 
-# ---------- OPTIMIZED Session restore and initialization ----------
+# ---------- Session restore ----------
 async def restore_sessions():
     logger.info("🔄 Restoring sessions...")
 
-    # fetch logged-in users in a thread to avoid blocking the event loop
     def _fetch_logged_in_users():
         conn = db.get_connection()
         cur = conn.cursor()
@@ -1960,7 +1859,6 @@ async def restore_sessions():
         logger.exception("Error fetching logged-in users from DB")
         users = []
 
-    # Preload tasks cache from DB (single DB call off the loop)
     try:
         all_active = await db_call(db.get_all_active_tasks)
     except Exception:
@@ -1982,14 +1880,12 @@ async def restore_sessions():
 
     logger.info("📊 Found %d logged in user(s)", len(users))
 
-    # OPTIMIZED: Restore sessions in batches to avoid memory spikes
     batch_size = 5
     for i in range(0, len(users), batch_size):
         batch = users[i:i + batch_size]
         restore_tasks = []
         
         for row in batch:
-            # row may be sqlite3.Row or tuple
             try:
                 user_id = row["user_id"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
                 session_data = row["session_data"] if isinstance(row, dict) or hasattr(row, "keys") else row[1]
@@ -2004,19 +1900,19 @@ async def restore_sessions():
         
         if restore_tasks:
             await asyncio.gather(*restore_tasks, return_exceptions=True)
-            await asyncio.sleep(1)  # Small delay between batches
+            await asyncio.sleep(1)
 
 
 async def restore_single_session(user_id: int, session_data: str):
     """Restore a single user session with error handling"""
     try:
+        # FIXED: Simplified Telethon client initialization
         client = TelegramClient(StringSession(session_data), API_ID, API_HASH)
         await client.connect()
 
         if await client.is_user_authorized():
             user_clients[user_id] = client
             target_entity_cache.setdefault(user_id, {})
-            # Try to resolve all targets for this user's tasks in background
             user_tasks = tasks_cache.get(user_id, [])
             all_targets = []
             for tt in user_tasks:
@@ -2044,20 +1940,17 @@ async def shutdown_cleanup():
     """Disconnect Telethon clients and cancel worker tasks cleanly."""
     logger.info("Shutdown cleanup: cancelling worker tasks and disconnecting clients...")
 
-    # cancel worker tasks
     for t in list(worker_tasks):
         try:
             t.cancel()
         except Exception:
             logger.exception("Error cancelling worker task")
     if worker_tasks:
-        # wait for tasks to finish cancellation
         try:
             await asyncio.gather(*worker_tasks, return_exceptions=True)
         except Exception:
             logger.exception("Error while awaiting worker task cancellations")
 
-    # disconnect telethon clients in batches
     user_ids = list(user_clients.keys())
     batch_size = 5
     for i in range(0, len(user_ids), batch_size):
@@ -2066,7 +1959,6 @@ async def shutdown_cleanup():
         for uid in batch:
             client = user_clients.get(uid)
             if client:
-                # remove handler if present
                 handler = handler_registered.get(uid)
                 if handler:
                     try:
@@ -2082,7 +1974,6 @@ async def shutdown_cleanup():
     
     user_clients.clear()
 
-    # close DB connection if needed
     try:
         db.close_connection()
     except Exception:
@@ -2091,7 +1982,7 @@ async def shutdown_cleanup():
     logger.info("Shutdown cleanup complete.")
 
 
-# ---------- Application post_init: start send workers and restore sessions ----------
+# ---------- Application post_init ----------
 async def post_init(application: Application):
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
@@ -2101,7 +1992,6 @@ async def post_init(application: Application):
     await application.bot.delete_webhook(drop_pending_updates=True)
     logger.info("🧹 Cleared webhooks")
 
-    # Ensure configured OWNER_IDS are present in DB as admin users
     if OWNER_IDS:
         for oid in OWNER_IDS:
             try:
@@ -2112,7 +2002,6 @@ async def post_init(application: Application):
             except Exception:
                 logger.exception("Error adding owner/admin %s from env", oid)
 
-    # Ensure configured ALLOWED_USERS are present in DB as allowed users (non-admin)
     if ALLOWED_USERS:
         for au in ALLOWED_USERS:
             try:
@@ -2121,15 +2010,10 @@ async def post_init(application: Application):
             except Exception:
                 logger.exception("Error adding allowed user %s from env: %s", au)
 
-    # start send workers and restore sessions
     await start_send_workers()
     await restore_sessions()
 
-    # register a monitoring callback with the webserver (best-effort, thread-safe)
     async def _collect_metrics():
-        """
-        Run inside the bot event loop to safely access asyncio objects and in-memory state.
-        """
         try:
             q = None
             try:
@@ -2147,9 +2031,6 @@ async def post_init(application: Application):
             return {"error": f"failed to collect metrics in loop: {e}"}
 
     def _forward_metrics():
-        """
-        This wrapper runs in the Flask thread; it will call into the bot's event loop to gather data safely.
-        """
         global MAIN_LOOP
         if MAIN_LOOP is None:
             return {"error": "bot main loop not available"}
@@ -2191,7 +2072,6 @@ def main():
 
     logger.info("🤖 Starting Forwarder Bot...")
 
-    # start webserver thread first (keeps /health available)
     start_server_thread()
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -2206,18 +2086,12 @@ def main():
     application.add_handler(CommandHandler("removeuser", removeuser_command))
     application.add_handler(CommandHandler("listusers", listusers_command))
     application.add_handler(CallbackQueryHandler(button_handler))
-    
-    # Add separate handler for delete confirmations
-    application.add_handler(CallbackQueryHandler(handle_confirm_delete, pattern=r"^confirm_delete_"))
-    
-    # Add message handlers for various states
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_process))
 
     logger.info("✅ Bot ready!")
     try:
         application.run_polling(drop_pending_updates=True)
     finally:
-        # run a final cleanup on a fresh loop to ensure Telethon clients are disconnected
         try:
             asyncio.run(shutdown_cleanup())
         except Exception:
