@@ -1048,21 +1048,23 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # First check if we're in task creation
-    if user_id in task_creation_states:
-        await handle_task_creation(update, context)
-        return
-    
-    # Check if we're waiting for prefix/suffix input
+    # Check if we're waiting for prefix/suffix input first
     if context.user_data.get("waiting_prefix") or context.user_data.get("waiting_suffix"):
         await handle_prefix_suffix_input(update, context)
         return
     
+    # Then check if we're in task creation
+    if user_id in task_creation_states:
+        await handle_task_creation(update, context)
+        return
+
+    # Check if we're in logout confirmation
     if user_id in logout_states:
         handled = await handle_logout_confirmation(update, context)
         if handled:
             return
 
+    # Finally, handle login process
     if user_id not in login_states:
         return
 
