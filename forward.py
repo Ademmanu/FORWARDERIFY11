@@ -706,8 +706,62 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def update_button_inline(query, task_label, toggle_type, new_state):
+    """Update button inline without refreshing entire message"""
+    keyboard = query.message.reply_markup.inline_keyboard
+    button_found = False
+    
+    # Determine new emoji based on new state
+    new_emoji = "✅" if new_state else "❌"
+    
+    # Update the specific button in the keyboard
+    for row in keyboard:
+        for i, button in enumerate(row):
+            if button.callback_data and button.callback_data.startswith(f"toggle_{task_label}_{toggle_type}"):
+                # Extract the text after the emoji (preserve the label)
+                current_text = button.text
+                # Find the first non-emoji character (skip the first character which is the emoji)
+                # Handle both single emoji and emoji+space
+                if current_text.startswith("✅ ") or current_text.startswith("❌ "):
+                    # Format is "✅ Label" or "❌ Label"
+                    text_without_emoji = current_text[2:]  # Skip emoji and space
+                    row[i] = InlineKeyboardButton(
+                        f"{new_emoji} {text_without_emoji}",
+                        callback_data=button.callback_data
+                    )
+                elif current_text.startswith("✅") or current_text.startswith("❌"):
+                    # Format is "✅Label" or "❌Label"
+                    text_without_emoji = current_text[1:]  # Skip just the emoji
+                    row[i] = InlineKeyboardButton(
+                        f"{new_emoji}{text_without_emoji}",
+                        callback_data=button.callback_data
+                    )
+                else:
+                    # Fallback: just replace the button text completely
+                    row[i] = InlineKeyboardButton(
+                        f"{new_emoji} {toggle_type.replace('_', ' ').title()}",
+                        callback_data=button.callback_data
+                    )
+                button_found = True
+                break
+        if button_found:
+            break
+    
+    if button_found:
+        # Update just the inline keyboard without changing message text
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        # If button not found, fall back to refreshing the entire menu
+        if toggle_type in ["outgoing", "forward_tag", "control"]:
+            await handle_task_menu(update, context)
+        else:
+            await handle_filter_menu(update, context)
+
+
 async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle toggle actions for filters and settings"""
+    """Handle toggle actions for filters and settings with instant button updates"""
     query = update.callback_query
     user_id = query.from_user.id
     data_parts = query.data.replace("toggle_", "").split("_")
@@ -732,28 +786,30 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     
     task = user_tasks[task_index]
     filters = task.get("filters", {})
+    new_state = None
     
+    # Determine which setting/filter is being toggled
     if toggle_type == "outgoing":
-        filters["outgoing"] = not filters.get("outgoing", True)
-        status = "✅ On" if filters["outgoing"] else "❌ Off"
-        await query.answer(f"Outgoing messages: {status}")
+        new_state = not filters.get("outgoing", True)
+        filters["outgoing"] = new_state
+        status_text = "Outgoing messages"
         
     elif toggle_type == "forward_tag":
-        filters["forward_tag"] = not filters.get("forward_tag", False)
-        status = "✅ On" if filters["forward_tag"] else "❌ Off"
-        await query.answer(f"Forward tag: {status}")
+        new_state = not filters.get("forward_tag", False)
+        filters["forward_tag"] = new_state
+        status_text = "Forward tag"
         
     elif toggle_type == "control":
-        filters["control"] = not filters.get("control", True)
-        status = "✅ On" if filters["control"] else "❌ Off"
-        await query.answer(f"Forwarding control: {status}")
+        new_state = not filters.get("control", True)
+        filters["control"] = new_state
+        status_text = "Forwarding control"
         
     elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric"]:
         filter_settings = filters.get("filters", {})
-        filter_settings[toggle_type] = not filter_settings.get(toggle_type, False)
+        new_state = not filter_settings.get(toggle_type, False)
+        filter_settings[toggle_type] = new_state
         filters["filters"] = filter_settings
-        status = "✅ On" if filter_settings[toggle_type] else "❌ Off"
-        await query.answer(f"{toggle_type.replace('_', ' ').title()}: {status}")
+        status_text = toggle_type.replace('_', ' ').title()
         
     elif toggle_type == "prefix_suffix":
         await show_prefix_suffix_menu(query, task_label)
@@ -764,26 +820,45 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         filter_settings["prefix"] = ""
         filter_settings["suffix"] = ""
         filters["filters"] = filter_settings
+        new_state = False  # Clear state is not a toggle, but we need to update the UI
+        # Update cache and DB
+        task["filters"] = filters
+        tasks_cache[user_id][task_index] = task
+        
+        try:
+            asyncio.create_task(
+                db_call(db.update_task_filters, user_id, task_label, filters)
+            )
+        except Exception as e:
+            logger.exception("Error updating task filters in DB: %s", e)
+        
         await query.answer("✅ Prefix and suffix cleared!")
+        # Refresh the filter menu to show cleared prefix/suffix
+        await handle_filter_menu(update, context)
+        return
     
     else:
         await query.answer(f"Unknown toggle type: {toggle_type}")
         return
     
+    # Update cache with new state
     task["filters"] = filters
     tasks_cache[user_id][task_index] = task
     
+    # Show immediate feedback and update button inline
+    status_display = "✅ On" if new_state else "❌ Off"
+    await query.answer(f"{status_text}: {status_display}")
+    
+    # Update the button inline without refreshing entire message
+    await update_button_inline(query, task_label, toggle_type, new_state)
+    
+    # Update database in background
     try:
         asyncio.create_task(
             db_call(db.update_task_filters, user_id, task_label, filters)
         )
     except Exception as e:
         logger.exception("Error updating task filters in DB: %s", e)
-    
-    if toggle_type in ["outgoing", "forward_tag", "control"]:
-        await handle_task_menu(update, context)
-    elif toggle_type in ["raw_text", "numbers_only", "alphabets_only", "removed_alphabetic", "removed_numeric", "clear_prefix_suffix"]:
-        await handle_filter_menu(update, context)
 
 
 async def show_prefix_suffix_menu(query, task_label):
@@ -2032,15 +2107,15 @@ async def post_init(application: Application):
 
     def _forward_metrics():
         global MAIN_LOOP
-        if MAIN_LOOP is None:
+        if MAIN_LOOP is not None:
+            try:
+                future = asyncio.run_coroutine_threadsafe(_collect_metrics(), MAIN_LOOP)
+                return future.result(timeout=1.0)
+            except Exception as e:
+                logger.exception("Failed to collect metrics from main loop")
+                return {"error": f"failed to collect metrics: {e}"}
+        else:
             return {"error": "bot main loop not available"}
-
-        try:
-            future = asyncio.run_coroutine_threadsafe(_collect_metrics(), MAIN_LOOP)
-            return future.result(timeout=1.0)
-        except Exception as e:
-            logger.exception("Failed to collect metrics from main loop")
-            return {"error": f"failed to collect metrics: {e}"}
 
     try:
         register_monitoring(_forward_metrics)
