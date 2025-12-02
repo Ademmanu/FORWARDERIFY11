@@ -820,8 +820,7 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
         filter_settings["prefix"] = ""
         filter_settings["suffix"] = ""
         filters["filters"] = filter_settings
-        new_state = False  # Clear state is not a toggle, but we need to update the UI
-        # Update cache and DB
+        new_state = False
         task["filters"] = filters
         tasks_cache[user_id][task_index] = task
         
@@ -833,7 +832,6 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.exception("Error updating task filters in DB: %s", e)
         
         await query.answer("✅ Prefix and suffix cleared!")
-        # Refresh the filter menu to show cleared prefix/suffix
         await handle_filter_menu(update, context)
         return
     
@@ -845,12 +843,64 @@ async def handle_toggle_action(update: Update, context: ContextTypes.DEFAULT_TYP
     task["filters"] = filters
     tasks_cache[user_id][task_index] = task
     
-    # Show immediate feedback and update button inline
+    # Show immediate feedback
     status_display = "✅ On" if new_state else "❌ Off"
     await query.answer(f"{status_text}: {status_display}")
     
-    # Update the button inline without refreshing entire message
-    await update_button_inline(query, task_label, toggle_type, new_state)
+    # Get the current keyboard and update the specific button
+    keyboard = query.message.reply_markup.inline_keyboard
+    
+    # Find and update the button with matching callback data
+    button_found = False
+    new_emoji = "✅" if new_state else "❌"
+    
+    for row in keyboard:
+        for i, button in enumerate(row):
+            if button.callback_data == query.data:
+                # Update just this button
+                current_text = button.text
+                # Extract the text after the emoji
+                if current_text.startswith("✅ "):
+                    text_without_emoji = current_text[2:]
+                    new_text = f"{new_emoji} {text_without_emoji}"
+                elif current_text.startswith("❌ "):
+                    text_without_emoji = current_text[2:]
+                    new_text = f"{new_emoji} {text_without_emoji}"
+                elif current_text.startswith("✅"):
+                    text_without_emoji = current_text[1:]
+                    new_text = f"{new_emoji}{text_without_emoji}"
+                elif current_text.startswith("❌"):
+                    text_without_emoji = current_text[1:]
+                    new_text = f"{new_emoji}{text_without_emoji}"
+                else:
+                    # Fallback
+                    new_text = f"{new_emoji} {toggle_type.replace('_', ' ').title()}"
+                
+                row[i] = InlineKeyboardButton(new_text, callback_data=query.data)
+                button_found = True
+                break
+        if button_found:
+            break
+    
+    # Update the keyboard inline
+    if button_found:
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.exception("Error updating inline keyboard: %s", e)
+            # Fall back to refreshing the entire menu if inline update fails
+            if toggle_type in ["outgoing", "forward_tag", "control"]:
+                await handle_task_menu(update, context)
+            else:
+                await handle_filter_menu(update, context)
+    else:
+        # If button not found, refresh the entire menu
+        if toggle_type in ["outgoing", "forward_tag", "control"]:
+            await handle_task_menu(update, context)
+        else:
+            await handle_filter_menu(update, context)
     
     # Update database in background
     try:
